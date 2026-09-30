@@ -85,6 +85,19 @@ function parseJsonPreservingIds(text: string): any {
 
 const TRUSTED_REDIRECT_HOSTS = new Set(["cloud.189.cn", "open.e.189.cn"])
 
+/**
+ * Cloudflare -> 189Cloud 偶发会返回 52x 网关错误。
+ * 这些错误通常是临时网络故障，可以安全重试 GET 与只读型 POST。
+ */
+const TRANSIENT_HTTP_STATUSES = new Set([
+  502, 503, 504, 520, 521, 522, 523, 524,
+])
+const TRANSIENT_RETRY_DELAYS_MS = [250, 750]
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 function isTrustedHttpsUrl(value: URL): boolean {
   return (
     value.protocol === "https:" && TRUSTED_REDIRECT_HOSTS.has(value.hostname)
@@ -177,6 +190,71 @@ export class Pan189Client {
     }
   }
 
+  /**
+   * 对 Cloudflare / 189Cloud 的临时 52x 与瞬时网络异常做有限重试。
+   *
+   * retryOnTransient = true:
+   *   第 1 次失败 -> 等待 250ms
+   *   第 2 次失败 -> 等待 750ms
+   *   第 3 次仍失败 -> 返回最后一次 Response / 抛出最后一次网络异常
+   *
+   * 写操作不要开启本重试，避免重复提交。
+   */
+  private async fetchWithTransientRetry(
+    url: string,
+    init: RequestInit,
+    retryOnTransient = false,
+  ): Promise<Response> {
+    const maxAttempts = retryOnTransient
+      ? TRANSIENT_RETRY_DELAYS_MS.length + 1
+      : 1
+
+    let lastError: unknown = null
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        const response = await fetch(url, init)
+        await this.updateCookie(response.headers)
+
+        if (!TRANSIENT_HTTP_STATUSES.has(response.status)) {
+          return response
+        }
+
+        if (attempt >= maxAttempts - 1) {
+          return response
+        }
+
+        // 释放 52x HTML / 纯文本错误页，避免占用连接资源。
+        try {
+          await response.body?.cancel()
+        } catch {
+          // ignore
+        }
+      } catch (error) {
+        lastError = error
+        if (attempt >= maxAttempts - 1) {
+          throw error
+        }
+      }
+
+      await sleep(TRANSIENT_RETRY_DELAYS_MS[attempt])
+    }
+
+    if (lastError) throw lastError
+    throw new Error("[189Cloud] 上游请求失败")
+  }
+
+  private assertNotTransientResponse(
+    response: Response,
+    stage: string,
+  ): void {
+    if (TRANSIENT_HTTP_STATUSES.has(response.status)) {
+      throw new Error(
+        `[189Cloud] ${stage}上游暂时不可达 (HTTP ${response.status})，请稍后重试`,
+      )
+    }
+  }
+
   private async followRedirectsWithCookies(
     initialUrl: string,
     headers: Record<string, string>,
@@ -197,12 +275,19 @@ export class Pan189Client {
       if (redirectCount > 0) requestHeaders.Referer = currentUrl
       if (this.cookie) requestHeaders.Cookie = this.cookie
 
-      const response = await fetch(currentUrl, {
-        method: "GET",
-        headers: requestHeaders,
-        redirect: "manual",
-      })
-      await this.updateCookie(response.headers)
+      const response = await this.fetchWithTransientRetry(
+        currentUrl,
+        {
+          method: "GET",
+          headers: requestHeaders,
+          redirect: "manual",
+        },
+        true,
+      )
+
+      // 旧逻辑会把 522 当作“重定向结束”，随后继续解析 lt / reqId，
+      // 因此产生“登录跳转参数不完整”的误导性二次错误。
+      this.assertNotTransientResponse(response, "登录")
 
       const location = response.headers.get("location")
       const isRedirect = response.status >= 300 && response.status < 400
@@ -276,7 +361,7 @@ export class Pan189Client {
       }
 
       if (attempt < 2) {
-        await new Promise((resolve) => setTimeout(resolve, 150 * (attempt + 1)))
+        await sleep(150 * (attempt + 1))
       }
     }
     return lastUrl
@@ -327,7 +412,9 @@ export class Pan189Client {
     const reqId = urlObj.searchParams.get("reqId") || ""
     const appId = urlObj.searchParams.get("appId") || "cloud"
     if (!lt || !reqId) {
-      throw new Error("[189Cloud] 登录跳转参数不完整，未获取到 lt 或 reqId")
+      throw new Error(
+        `[189Cloud] 登录跳转参数不完整，未获取到 lt 或 reqId（最终地址: ${urlObj.origin}${urlObj.pathname}）`,
+      )
     }
 
     const authHeaders = () => {
@@ -345,8 +432,8 @@ export class Pan189Client {
       return result
     }
 
-    // 1. 获取 App 配置
-    const appConfRes = await fetch(
+    // 1. 获取 App 配置（只读 POST，可安全重试临时 52x）
+    const appConfRes = await this.fetchWithTransientRetry(
       "https://open.e.189.cn/api/logbox/oauth2/appConf.do",
       {
         method: "POST",
@@ -356,8 +443,9 @@ export class Pan189Client {
           appKey: appId,
         }),
       },
+      true,
     )
-    await this.updateCookie(appConfRes.headers)
+    this.assertNotTransientResponse(appConfRes, "获取 AppConf 时")
     const appConf: AppConfResp189 = await appConfRes.json()
     if (appConf.result !== "0" || !appConf.data) {
       throw new Error(
@@ -365,8 +453,8 @@ export class Pan189Client {
       )
     }
 
-    // 2. 获取加密配置 (公钥 & 前缀)
-    const encConfRes = await fetch(
+    // 2. 获取加密配置 (公钥 & 前缀)（只读 POST，可安全重试）
+    const encConfRes = await this.fetchWithTransientRetry(
       "https://open.e.189.cn/api/logbox/config/encryptConf.do",
       {
         method: "POST",
@@ -375,8 +463,9 @@ export class Pan189Client {
           appId,
         }),
       },
+      true,
     )
-    await this.updateCookie(encConfRes.headers)
+    this.assertNotTransientResponse(encConfRes, "获取 EncryptConf 时")
     const encConf: EncryptConfResp189 = await encConfRes.json()
     if (encConf.result !== 0 || !encConf.data?.pubKey) {
       throw new Error(
@@ -392,6 +481,7 @@ export class Pan189Client {
     const encPassword = pre + rsaEncode(this.addition.password, pubKey, true)
 
     // 4. 提交登录
+    // loginSubmit 可能产生登录状态变化，因此不做自动重放。
     const loginParams: Record<string, string> = {
       version: "v2.0",
       apToken: "",
@@ -413,7 +503,7 @@ export class Pan189Client {
       paramId: appConf.data.paramId || "",
     }
 
-    const loginRes = await fetch(
+    const loginRes = await this.fetchWithTransientRetry(
       "https://open.e.189.cn/api/logbox/oauth2/loginSubmit.do",
       {
         method: "POST",
@@ -422,9 +512,19 @@ export class Pan189Client {
         },
         body: new URLSearchParams(loginParams),
       },
+      false,
     )
-    await this.updateCookie(loginRes.headers)
-    const loginData = await loginRes.json()
+    this.assertNotTransientResponse(loginRes, "提交登录时")
+
+    let loginData: any
+    try {
+      loginData = await loginRes.json()
+    } catch {
+      throw new Error(
+        `[189Cloud] 登录接口返回非 JSON 响应 (HTTP ${loginRes.status})`,
+      )
+    }
+
     if (loginData.result !== 0) {
       const msg = loginData.msg || "登录失败"
       if (
@@ -488,19 +588,36 @@ export class Pan189Client {
       reqBody = new URLSearchParams(options.body).toString()
     }
 
-    const res = await fetch(urlObj.toString(), {
-      method,
-      headers,
-      body: reqBody,
-    })
-
-    await this.updateCookie(res.headers)
+    // 普通 GET 请求允许重试 52x；POST 写操作不自动重放。
+    const res = await this.fetchWithTransientRetry(
+      urlObj.toString(),
+      {
+        method,
+        headers,
+        body: reqBody,
+      },
+      method === "GET",
+    )
 
     const text = await res.text()
+
+    // Cloudflare 的 52x 通常是 HTML / 纯文本，例如 "error code: 522"。
+    // 必须在 JSON.parse 之前处理，否则会误报“非预期响应”。
+    if (TRANSIENT_HTTP_STATUSES.has(res.status)) {
+      throw new Error(
+        `[189Cloud] 上游暂时不可达 (HTTP ${res.status})，请稍后重试`,
+      )
+    }
+
     let data: any
     try {
       data = parseJsonPreservingIds(text)
     } catch {
+      if (!res.ok) {
+        throw new Error(
+          `[189Cloud] HTTP 请求失败 (${res.status}): ${text.slice(0, 120)}`,
+        )
+      }
       throw new Error(`[189Cloud] 非预期响应: ${text.slice(0, 200)}`)
     }
 
